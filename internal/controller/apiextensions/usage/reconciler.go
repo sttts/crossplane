@@ -20,6 +20,7 @@ package usage
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -215,6 +216,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		log.Debug(errGetUsage, "error", err)
 		return reconcile.Result{}, errors.Wrap(xpresource.IgnoreNotFound(err), errGetUsage)
 	}
+	orig := u.DeepCopy()
 
 	if err := r.usage.resolveSelectors(ctx, u); err != nil {
 		log.Debug(errResolveSelectors, "error", err)
@@ -406,11 +408,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 
 	u.Status.SetConditions(xpv1.Available())
-	r.record.Event(u, event.Normal(reasonUsageConfigured, "Usage configured successfully."))
+
 	// We are only watching the Usage itself but not using or used resources.
 	// So, we need to reconcile the Usage periodically to check if the using
 	// or used resources are still there.
-	return reconcile.Result{RequeueAfter: r.pollInterval}, errors.Wrap(r.client.Status().Update(ctx, u), errUpdateStatus)
+	if !reflect.DeepEqual(u, orig) {
+		r.record.Event(u, event.Normal(reasonUsageConfigured, "Usage configured successfully."))
+		return reconcile.Result{RequeueAfter: r.pollInterval}, errors.Wrap(r.client.Status().Update(ctx, u), errUpdateStatus)
+	}
+
+	return reconcile.Result{RequeueAfter: r.pollInterval}, nil
 }
 
 func detailsAnnotation(u *v1alpha1.Usage) string {
