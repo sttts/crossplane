@@ -18,6 +18,7 @@ limitations under the License.
 package apiextensions
 
 import (
+	mcctrl "github.com/multicluster-runtime/multicluster-runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/crossplane/crossplane/internal/controller/apiextensions/composition"
@@ -29,7 +30,7 @@ import (
 )
 
 // Setup API extensions controllers.
-func Setup(mgr ctrl.Manager, o controller.Options) error {
+func Setup(mgr mcctrl.Manager, o controller.Options) error {
 	if err := composition.Setup(mgr, o); err != nil {
 		return err
 	}

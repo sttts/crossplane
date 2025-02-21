@@ -23,11 +23,14 @@ import (
 	"strings"
 	"time"
 
+	mcctrl "github.com/multicluster-runtime/multicluster-runtime"
+	mcclient "github.com/multicluster-runtime/multicluster-runtime/pkg/client"
+	mcmanager "github.com/multicluster-runtime/multicluster-runtime/pkg/manager"
+	"github.com/multicluster-runtime/multicluster-runtime/pkg/multicluster"
+	mcreconciler "github.com/multicluster-runtime/multicluster-runtime/pkg/reconcile"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/crossplane/crossplane-runtime/pkg/errors"
@@ -63,19 +66,27 @@ const (
 
 // Setup adds a controller that reconciles Compositions by creating new
 // CompositionRevisions for each revision of the Composition's spec.
-func Setup(mgr ctrl.Manager, o controller.Options) error {
+func Setup(mgr mcctrl.Manager, o controller.TypedOptions[mcreconciler.Request]) error {
 	name := "revisions/" + strings.ToLower(v1.CompositionGroupKind)
+
+	rec := multicluster.Func[event.Recorder](func(clusterName string) (event.Recorder, error) {
+		cl, err := mgr.GetCluster(clusterName)
+		if err != nil {
+			return nil, err
+		}
+		return event.NewAPIRecorder(cl.GetEventRecorderFor(name)), nil
+	})
 
 	r := NewReconciler(mgr,
 		WithLogger(o.Logger.WithValues("controller", name)),
-		WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))))
+		WithRecorder(rec))
 
-	return ctrl.NewControllerManagedBy(mgr).
+	return mcctrl.NewControllerManagedBy(mgr).
 		Named(name).
 		For(&v1.Composition{}).
 		Owns(&v1.CompositionRevision{}).
 		WithOptions(o.ForControllerRuntime()).
-		Complete(ratelimiter.NewReconciler(name, errors.WithSilentRequeueOnConflict(r), o.GlobalRateLimiter))
+		Complete(ratelimiter.NewTypedReconciler[mcreconciler.Request](name, errors.WithTypedSilentRequeueOnConflict(r), o.GlobalRateLimiter))
 }
 
 // ReconcilerOption is used to configure the Reconciler.
@@ -89,18 +100,18 @@ func WithLogger(log logging.Logger) ReconcilerOption {
 }
 
 // WithRecorder specifies how the Reconciler should record Kubernetes events.
-func WithRecorder(er event.Recorder) ReconcilerOption {
+func WithRecorder(er multicluster.Func[event.Recorder]) ReconcilerOption {
 	return func(r *Reconciler) {
 		r.record = er
 	}
 }
 
 // NewReconciler returns a Reconciler of Compositions.
-func NewReconciler(mgr manager.Manager, opts ...ReconcilerOption) *Reconciler {
+func NewReconciler(mgr mcmanager.Manager, opts ...ReconcilerOption) *Reconciler {
 	r := &Reconciler{
 		client: mgr.GetClient(),
 		log:    logging.NewNopLogger(),
-		record: event.NewNopRecorder(),
+		record: multicluster.Static[event.Recorder](event.NewNopRecorder()),
 	}
 
 	for _, f := range opts {
@@ -112,14 +123,14 @@ func NewReconciler(mgr manager.Manager, opts ...ReconcilerOption) *Reconciler {
 // A Reconciler reconciles Compositions by creating new CompositionRevisions for
 // each revision of the Composition's spec.
 type Reconciler struct {
-	client client.Client
+	client mcclient.Client
 
 	log    logging.Logger
-	record event.Recorder
+	record multicluster.Func[event.Recorder]
 }
 
 // Reconcile a Composition.
-func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+func (r *Reconciler) Reconcile(ctx context.Context, req mcreconciler.Request) (reconcile.Result, error) {
 	log := r.log.WithValues("request", req)
 	log.Debug("Reconciling")
 
@@ -127,9 +138,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	defer cancel()
 
 	comp := &v1.Composition{}
-	if err := r.client.Get(ctx, req.NamespacedName, comp); err != nil {
+	cli, err := r.client(req.ClusterName)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	rec, err := r.record(req.ClusterName)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if err := cli.Get(ctx, req.NamespacedName, comp); err != nil {
 		log.Debug(errGet, "error", err)
-		r.record.Event(comp, event.Warning(reasonCreateRev, errors.Wrap(err, errGet)))
+		rec.Event(comp, event.Warning(reasonCreateRev, errors.Wrap(err, errGet)))
 		return reconcile.Result{}, errors.Wrap(resource.IgnoreNotFound(err), errGet)
 	}
 
@@ -147,9 +166,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	)
 
 	rl := &v1.CompositionRevisionList{}
-	if err := r.client.List(ctx, rl, client.MatchingLabels{v1.LabelCompositionName: comp.GetName()}); err != nil {
+	if err := cli.List(ctx, rl, client.MatchingLabels{v1.LabelCompositionName: comp.GetName()}); err != nil {
 		log.Debug(errListRevs, "error", err)
-		r.record.Event(comp, event.Warning(reasonCreateRev, errors.Wrap(err, errListRevs)))
+		rec.Event(comp, event.Warning(reasonCreateRev, errors.Wrap(err, errListRevs)))
 		return reconcile.Result{}, errors.Wrap(err, errListRevs)
 	}
 
@@ -171,12 +190,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			// re-add the owner reference to all revisions of this Composition.
 			if err := meta.AddControllerReference(rev, meta.AsController(meta.TypedReferenceTo(comp, v1.CompositionGroupVersionKind))); err != nil {
 				log.Debug(errOwnRev, "error", err)
-				r.record.Event(comp, event.Warning(reasonUpdateRev, err))
+				rec.Event(comp, event.Warning(reasonUpdateRev, err))
 				return reconcile.Result{}, errors.Wrap(err, errOwnRev)
 			}
-			if err := r.client.Update(ctx, rev); err != nil {
+			if err := cli.Update(ctx, rev); err != nil {
 				log.Debug(errOwnRev, "error", err)
-				r.record.Event(comp, event.Warning(reasonUpdateRev, err))
+				rec.Event(comp, event.Warning(reasonUpdateRev, err))
 				return reconcile.Result{}, errors.Wrap(err, errOwnRev)
 			}
 		}
@@ -196,12 +215,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 
 		// This revision does not have the highest revision number. Update it so that it does.
 		rev.Spec.Revision = latestRev + 1
-		if err := r.client.Update(ctx, rev); err != nil {
+		if err := cli.Update(ctx, rev); err != nil {
 			log.Debug(errUpdateRevSpec, "error", err)
 			if kerrors.IsConflict(err) {
 				return reconcile.Result{Requeue: true}, nil
 			}
-			r.record.Event(comp, event.Warning(reasonUpdateRev, err))
+			rec.Event(comp, event.Warning(reasonUpdateRev, err))
 			return reconcile.Result{}, errors.Wrap(err, errUpdateRevSpec)
 		}
 	}
@@ -212,13 +231,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, nil
 	}
 
-	if err := r.client.Create(ctx, NewCompositionRevision(comp, latestRev+1)); err != nil {
+	if err := cli.Create(ctx, NewCompositionRevision(comp, latestRev+1)); err != nil {
 		log.Debug(errCreateRev, "error", err)
-		r.record.Event(comp, event.Warning(reasonCreateRev, err))
+		rec.Event(comp, event.Warning(reasonCreateRev, err))
 		return reconcile.Result{}, errors.Wrap(err, errCreateRev)
 	}
 
 	log.Debug("Created new revision", "revision", latestRev+1)
-	r.record.Event(comp, event.Normal(reasonCreateRev, "Created new revision", "revision", strconv.FormatInt(latestRev+1, 10)))
+	rec.Event(comp, event.Normal(reasonCreateRev, "Created new revision", "revision", strconv.FormatInt(latestRev+1, 10)))
 	return reconcile.Result{}, nil
 }

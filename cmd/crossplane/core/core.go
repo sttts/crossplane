@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
+	mcctrl "github.com/multicluster-runtime/multicluster-runtime"
+	"github.com/multicluster-runtime/multicluster-runtime/pkg/multicluster"
 	"github.com/spf13/afero"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,6 +39,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -48,7 +51,6 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/resource/unstructured"
-
 	"github.com/crossplane/crossplane/internal/controller/apiextensions"
 	apiextensionscontroller "github.com/crossplane/crossplane/internal/controller/apiextensions/controller"
 	"github.com/crossplane/crossplane/internal/controller/pkg"
@@ -158,7 +160,7 @@ func (c *startCommand) Run(s *runtime.Scheme, log logging.Logger) error { //noli
 	// The claim and XR controllers don't use the manager's cache or client.
 	// They use their own. They're setup later in this method.
 	eb := record.NewBroadcaster()
-	mgr, err := ctrl.NewManager(ratelimiter.LimitRESTConfig(cfg, c.MaxReconcileRate), ctrl.Options{
+	mgr, err := mcctrl.NewManager(ratelimiter.LimitRESTConfig(cfg, c.MaxReconcileRate), nil, ctrl.Options{
 		Scheme: s,
 		Cache: cache.Options{
 			SyncPeriod: &c.SyncInterval,
@@ -248,14 +250,20 @@ func (c *startCommand) Run(s *runtime.Scheme, log logging.Logger) error { //noli
 	metrics.Registry.MustRegister(m)
 
 	// We want all XR controllers to share the same gRPC clients.
-	functionRunner := xfn.NewPackagedFunctionRunner(mgr.GetClient(),
-		xfn.WithLogger(log),
-		xfn.WithTLSConfig(clienttls),
-		xfn.WithInterceptorCreators(m),
-	)
+	functionRunner := multicluster.New[*xfn.PackagedFunctionRunner](mgr.GetLocalManager(), func(ctx context.Context, clusterName string, cl cluster.Cluster) (*xfn.PackagedFunctionRunner, error) {
+		functionRunner := xfn.NewPackagedFunctionRunner(cl.GetClient(),
+			xfn.WithLogger(log),
+			xfn.WithTLSConfig(clienttls),
+			xfn.WithInterceptorCreators(m),
+		)
 
-	// Periodically remove clients for Functions that no longer exist.
-	go functionRunner.GarbageCollectConnections(ctx, 10*time.Minute)
+		// Periodically remove clients for Functions that no longer exist.
+		go functionRunner.GarbageCollectConnections(ctx, 10*time.Minute)
+		return functionRunner, nil
+	})
+	if err := mgr.Add(functionRunner); err != nil {
+		return errors.Wrap(err, "cannot add function runner runnable to manager")
+	}
 
 	if c.EnableCompositionWebhookSchemaValidation {
 		o.Features.Enable(features.EnableBetaCompositionWebhookSchemaValidation)
@@ -312,90 +320,124 @@ func (c *startCommand) Run(s *runtime.Scheme, log logging.Logger) error { //noli
 	// start and stop their watches (e.g. of composed resources) dynamically. To
 	// do this, the ControllerEngine must have exclusive ownership of a cache.
 	// This allows it to track what controllers are using the cache's informers.
-	ca, err := cache.New(mgr.GetConfig(), cache.Options{
-		HTTPClient: mgr.GetHTTPClient(),
-		Scheme:     mgr.GetScheme(),
-		Mapper:     mgr.GetRESTMapper(),
-		SyncPeriod: &c.SyncInterval,
+	ca := multicluster.New[cache.Cache](mgr.GetLocalManager(), func(ctx context.Context, clusterName string, cl cluster.Cluster) (cache.Cache, error) {
+		ca, err := cache.New(cl.GetConfig(), cache.Options{
+			HTTPClient: cl.GetHTTPClient(),
+			Scheme:     cl.GetScheme(),
+			Mapper:     cl.GetRESTMapper(),
+			SyncPeriod: &c.SyncInterval,
 
-		// When a CRD is deleted, any informers for its GVKs will start trying
-		// to restart their watches, and fail with scary errors. This should
-		// only happen when realtime composition is enabled, and we should GC
-		// the informer within 60 seconds. This handler tries to make the error
-		// a little more informative, and less scary.
-		DefaultWatchErrorHandler: func(_ *kcache.Reflector, err error) {
-			if errors.Is(io.EOF, err) {
-				// Watch closed normally.
-				return
-			}
-			log.Debug("Watch error - probably due to CRD being uninstalled", "error", err)
-		},
+			// When a CRD is deleted, any informers for its GVKs will start trying
+			// to restart their watches, and fail with scary errors. This should
+			// only happen when realtime composition is enabled, and we should GC
+			// the informer within 60 seconds. This handler tries to make the error
+			// a little more informative, and less scary.
+			DefaultWatchErrorHandler: func(_ *kcache.Reflector, err error) {
+				if errors.Is(io.EOF, err) {
+					// Watch closed normally.
+					return
+				}
+				log.Debug("Watch error - probably due to CRD being uninstalled", "error", err)
+			},
+		})
+		if err != nil {
+			return ca, errors.Wrap(err, "cannot create cache for API extension controllers")
+		}
+		return ca, nil
 	})
-	if err != nil {
-		return errors.Wrap(err, "cannot create cache for API extension controllers")
+	if err := mgr.Add(ca); err != nil {
+		return errors.Wrapf(err, "failed adding API extensions cache instances to manager")
 	}
 
-	go func() {
-		// Don't start the cache until the manager is elected.
-		<-mgr.Elected()
-
-		if err := ca.Start(ctx); err != nil {
-			log.Info("API extensions cache returned an error", "error", err)
+	cached := multicluster.New[client.Client](mgr.GetLocalManager(), func(ctx context.Context, clusterName string, cl cluster.Cluster) (client.Client, error) {
+		ca, err := ca.Get(clusterName)
+		if err != nil {
+			return nil, err
 		}
+		cached, err := client.New(cl.GetConfig(), client.Options{
+			HTTPClient: cl.GetHTTPClient(),
+			Scheme:     cl.GetScheme(),
+			Mapper:     cl.GetRESTMapper(),
+			Cache: &client.CacheOptions{
+				Reader: ca,
 
-		log.Info("API extensions cache stopped")
-	}()
+				// Don't cache secrets - there may be a lot of them.
+				DisableFor: []client.Object{&corev1.Secret{}},
 
-	cached, err := client.New(mgr.GetConfig(), client.Options{
-		HTTPClient: mgr.GetHTTPClient(),
-		Scheme:     mgr.GetScheme(),
-		Mapper:     mgr.GetRESTMapper(),
-		Cache: &client.CacheOptions{
-			Reader: ca,
-
-			// Don't cache secrets - there may be a lot of them.
-			DisableFor: []client.Object{&corev1.Secret{}},
-
-			// Cache unstructured resources (like XRs and MRs) on Get and List.
-			Unstructured: true,
-		},
+				// Cache unstructured resources (like XRs and MRs) on Get and List.
+				Unstructured: true,
+			},
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "cannot create client for API extension controllers")
+		}
+		return cached, nil
 	})
-	if err != nil {
-		return errors.Wrap(err, "cannot create client for API extension controllers")
+	if err := mgr.Add(cached); err != nil {
+		return errors.Wrap(err, "cannot add client API extensions controller instances to manager")
 	}
 
 	// Create a separate no-cache client for use when the composite controller does not find an Unstructured
 	// resource that it expects to find in the cache.
-	uncached, err := client.New(mgr.GetConfig(), client.Options{
-		HTTPClient: mgr.GetHTTPClient(),
-		Scheme:     mgr.GetScheme(),
-		Mapper:     mgr.GetRESTMapper(),
+	uncached := multicluster.New[client.Client](mgr.GetLocalManager(), func(ctx context.Context, clusterName string, cl cluster.Cluster) (client.Client, error) {
+		uncached, err := client.New(cl.GetConfig(), client.Options{
+			HTTPClient: cl.GetHTTPClient(),
+			Scheme:     cl.GetScheme(),
+			Mapper:     cl.GetRESTMapper(),
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "cannot create uncached client for API extension controllers")
+		}
+		return uncached, nil
 	})
-	if err != nil {
-		return errors.Wrap(err, "cannot create uncached client for API extension controllers")
+	if err := mgr.Add(cached); err != nil {
+		return errors.Wrap(err, "cannot add uncached client for API extension controllers instances to manager")
 	}
 
 	// It's important the engine's client is wrapped with unstructured.NewClient
 	// because controller-runtime always caches *unstructured.Unstructured, not
 	// our wrapper types like *composite.Unstructured. This client takes care of
 	// automatically wrapping and unwrapping *unstructured.Unstructured.
-	ce := engine.New(mgr,
-		engine.TrackInformers(ca, mgr.GetScheme()),
-		unstructured.NewClient(cached),
-		unstructured.NewClient(uncached),
-		engine.WithLogger(log),
-	)
+	ce := multicluster.New[*engine.ControllerEngine](mgr.GetLocalManager(), func(ctx context.Context, clusterName string, cl cluster.Cluster) (*engine.ControllerEngine, error) {
+		mgr, err := mgr.GetManager(clusterName)
+		if err != nil {
+			return nil, err
+		}
+		ca, err := ca.Get(clusterName)
+		if err != nil {
+			return nil, err
+		}
+		cached, err := cached.Get(clusterName)
+		if err != nil {
+			return nil, err
+		}
+		uncached, err := uncached.Get(clusterName)
+		if err != nil {
+			return nil, err
+		}
+		ce := engine.New(mgr,
+			engine.TrackInformers(ca, cl.GetScheme()),
+			unstructured.NewClient(cached),
+			unstructured.NewClient(uncached),
+			engine.WithLogger(log),
+		)
 
-	// TODO(negz): Garbage collect informers for CRs that are still defined
-	// (i.e. still have CRDs) but aren't used? Currently if an XR starts
-	// composing a kind of CR then stops, we won't stop the unused informer
-	// until the CRD that defines the CR is deleted. That could never happen.
-	// Consider for example composing two types of MR from the same provider,
-	// then updating to compose only one.
+		// TODO(negz): Garbage collect informers for CRs that are still defined
+		// (i.e. still have CRDs) but aren't used? Currently if an XR starts
+		// composing a kind of CR then stops, we won't stop the unused informer
+		// until the CRD that defines the CR is deleted. That could never happen.
+		// Consider for example composing two types of MR from the same provider,
+		// then updating to compose only one.
 
-	// Garbage collect informers for custom resources when their CRD is deleted.
-	if err := ce.GarbageCollectCustomResourceInformers(ctx); err != nil {
-		return errors.Wrap(err, "cannot start garbage collector for custom resource informers")
+		// Garbage collect informers for custom resources when their CRD is deleted.
+		if err := ce.GarbageCollectCustomResourceInformers(ctx); err != nil {
+			return nil, errors.Wrap(err, "cannot start garbage collector for custom resource informers")
+		}
+
+		return ce, nil
+	})
+	if err := mgr.Add(cached); err != nil {
+		return errors.Wrap(err, "cannot add controller engine instances to manager")
 	}
 
 	ao := apiextensionscontroller.Options{
@@ -403,7 +445,7 @@ func (c *startCommand) Run(s *runtime.Scheme, log logging.Logger) error { //noli
 		ControllerEngine: ce,
 		FunctionRunner:   functionRunner,
 	}
-
+		
 	if err := apiextensions.Setup(mgr, ao); err != nil {
 		return errors.Wrap(err, "cannot setup API extension controllers")
 	}

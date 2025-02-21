@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 
+	mcctrl "github.com/multicluster-runtime/multicluster-runtime"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -45,7 +46,7 @@ const (
 )
 
 // SetupWebhookWithManager sets up the webhook with the manager.
-func SetupWebhookWithManager(mgr ctrl.Manager, _ controller.Options) error {
+func SetupWebhookWithManager(mgr mcctrl.Manager, _ controller.Options) error {
 	v := &validator{client: mgr.GetClient()}
 	return ctrl.NewWebhookManagedBy(mgr).
 		WithValidator(v).

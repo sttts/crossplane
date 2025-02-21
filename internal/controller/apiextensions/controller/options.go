@@ -18,19 +18,24 @@ limitations under the License.
 package controller
 
 import (
+	"github.com/multicluster-runtime/multicluster-runtime/pkg/multicluster"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
 
 	"github.com/crossplane/crossplane/internal/engine"
 	"github.com/crossplane/crossplane/internal/xfn"
 )
 
-// Options specific to apiextensions controllers.
-type Options struct {
-	controller.Options
+type Options = TypedOptions[reconcile.Request]
+
+// TypedOptions specific to apiextensions controllers.
+type TypedOptions[request comparable] struct {
+	controller.TypedOptions[request]
 
 	// ControllerEngine used to dynamically start and stop controllers.
-	ControllerEngine *engine.ControllerEngine
+	ControllerEngine *multicluster.Instances[*engine.ControllerEngine]
 
 	// FunctionRunner used to run Composition Functions.
-	FunctionRunner *xfn.PackagedFunctionRunner
+	FunctionRunner *multicluster.Instances[*xfn.PackagedFunctionRunner]
 }
